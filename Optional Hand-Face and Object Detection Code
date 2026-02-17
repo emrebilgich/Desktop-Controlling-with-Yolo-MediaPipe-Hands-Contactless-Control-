@@ -1,0 +1,152 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+import pyttsx3
+from ultralytics import YOLO
+
+# ================ MODEL VE MODÜL YÜKLEME =================
+yolo_model = YOLO('best.pt')
+mp_hands = mp.solutions.hands
+mp_face_mesh = mp.solutions.face_mesh  # Face Mesh eklendi
+mp_draw = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles  # Şık çizim stili için
+
+# ================ AYARLAR =================
+ACTION_COOLDOWN = 2.0
+FINGER_UP_THRESHOLD = 0.12
+screen_w, screen_h = pyautogui.size()
+last_action_time = 0
+
+# --- SES AYARI ---
+engine = pyttsx3.init()
+engine.setProperty('rate', 180)
+
+
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
+
+
+# =============== HELPERS ==================
+def get_finger_status(lm):
+    fingers = []
+    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        fingers.append(lm[tip].y < lm[pip].y - FINGER_UP_THRESHOLD)
+    thumb_up = lm[4].y < lm[3].y - 0.05
+    return thumb_up, fingers
+
+
+# ================ MAIN ====================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+# Modülleri başlat
+with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7) as hands, \
+        mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as face_mesh:
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+        now = time.time()
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 1. ADIM: Face Mesh (Yüz Hatlarını Çizme ve Filtre)
+        face_boxes = []
+        mesh_results = face_mesh.process(rgb_frame)
+
+        if mesh_results.multi_face_landmarks:
+            for face_landmarks in mesh_results.multi_face_landmarks:
+                # --- YÜZ HATLARI ÇİZİMİ ---
+                # 1. Yüz ovalini ve hatlarını çiz (Ağ görünümlü)
+                mp_draw.draw_landmarks(
+                    image=frame,
+                    landmark_list=face_landmarks,
+                    connections=mp_face_mesh.FACEMESH_TESSELATION,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+
+                # 2. Göz, kaş ve dudak çizgilerini daha belirgin çiz
+                mp_draw.draw_landmarks(
+                    image=frame,
+                    landmark_list=face_landmarks,
+                    connections=mp_face_mesh.FACEMESH_CONTOURS,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style())
+
+                # Filtreleme için yüz sınırlarını belirle (YOLO koruması için)
+                all_x = [lm.x for lm in face_landmarks.landmark]
+                all_y = [lm.y for lm in face_landmarks.landmark]
+                fx1, fy1 = int(min(all_x) * w), int(min(all_y) * h)
+                fx2, fy2 = int(max(all_x) * w), int(max(all_y) * h)
+                face_boxes.append((fx1, fy1, fx2, fy2))
+
+        # 2. ADIM: YOLO Nesne Tespiti
+        detected_objects = []
+        yolo_results = yolo_model(frame, stream=True, conf=0.15, device=0, verbose=False)
+
+        for r in yolo_results:
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                label = yolo_model.names[int(box.cls[0])]
+
+                # Yüz Çakışma Filtresi
+                is_on_face = False
+                center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                for (f_x1, f_y1, f_x2, f_y2) in face_boxes:
+                    if f_x1 < center_x < f_x2 and f_y1 < center_y < f_y2:
+                        is_on_face = True
+                        break
+
+                if is_on_face: continue
+
+                detected_objects.append({"label": label, "box": (x1, y1, x2, y2), "conf": conf})
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                cv2.putText(frame, f"{label} %{int(conf * 100)}", (x1, y1 - 10), 1, 1, (255, 255, 255), 2)
+
+        # 3. ADIM: El İşleme ve Komutlar
+        hand_results = hands.process(rgb_frame)
+        if hand_results.multi_hand_landmarks:
+            for hand_landmarks in hand_results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                lm = hand_landmarks.landmark
+                thumb_up, other_fingers = get_finger_status(lm)
+                up_count = sum(other_fingers)
+                ix, iy = int(lm[8].x * w), int(lm[8].y * h)
+
+                for obj in detected_objects:
+                    ox1, oy1, ox2, oy2 = obj["box"]
+                    if ox1 < ix < ox2 and oy1 < iy < oy2:
+                        cv2.rectangle(frame, (ox1, oy1), (ox2, oy2), (0, 255, 0), 4)
+                        if now - last_action_time > ACTION_COOLDOWN:
+                            msg = ""
+                            if obj["label"] == "cups" and thumb_up and up_count == 0:
+                                pyautogui.press("playpause");
+                                msg = "Müzik kontrol edildi"
+                            elif obj["label"] == "phones" and up_count == 2:
+                                pyautogui.hotkey('win', 'prtscr');
+                                msg = "Ekran görüntüsü alındı"
+                            elif obj["label"] == "pencils" and up_count >= 3:
+                                pyautogui.press("volumemute");
+                                msg = "Sesi kapatıldı"
+                            elif obj["label"] == "keyboards" and not thumb_up and up_count == 0:
+                                pyautogui.hotkey('win', 'd');
+                                msg = "Masaüstüne dönüldü"
+
+                            if msg: speak(msg); last_action_time = now
+
+        # Rehber Panel
+        cv2.rectangle(frame, (5, h - 110), (320, h - 10), (0, 0, 0), -1)
+        cv2.putText(frame, "REHBER:", (10, h - 90), 1, 1, (0, 255, 255), 2)
+        panel = ["Cup: Bas Parmak(Muzigi Oynat/Durdur", "Phone: Zafer(2) (ScreenShot)", "Keyboard: Yumruk(0) (Masaustune Don", "Pencil: Acik El(5) (Mute/Open)"]
+        for i, t in enumerate(panel):
+            cv2.putText(frame, t, (15, h - 70 + (i * 15)), 1, 0.8, (255, 255, 255), 1)
+
+        cv2.imshow("Fütüristik Kontrol Paneli", frame)
+        if cv2.waitKey(1) & 0xFF == 27: break
+
+cap.release()
+cv2.destroyAllWindows()
