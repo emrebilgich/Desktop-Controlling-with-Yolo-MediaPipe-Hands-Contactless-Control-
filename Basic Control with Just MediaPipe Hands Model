@@ -1,0 +1,396 @@
+# hand_mouse_control_fixed.py
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import pyautogui
+import time
+import os
+import platform
+from ctypes import POINTER, cast
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from comtypes import CLSCTX_ALL
+
+# Windows ses/brightness kontrol (isteğe bağlı)
+_HAS_PYCAW = False
+_HAS_SBC = False
+_volume_interface = None
+_prev_volume_before_mute = None
+_prev_brightness_before_off = None
+
+if platform.system() == "Windows":
+    try:
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+        _HAS_PYCAW = True
+    except Exception:
+        _HAS_PYCAW = False
+    try:
+        import screen_brightness_control as sbc
+
+        _HAS_SBC = True
+    except Exception:
+        _HAS_SBC = False
+
+# ================ AYARLAR =================
+MODEL_PATH = 'hand_landmarker.task'  # Task dosyanın adı
+SMOOTHING = 6.0
+CLICK_COOLDOWN = 0.5
+VOLUME_STEP = 0.03
+BRIGHTNESS_STEP = 3
+FINGER_UP_THRESHOLD = 0.12
+VOLUME_COOLDOWN_TIME = 0.07
+BRIGHTNESS_COOLDOWN_TIME = 0.07
+MUTE_HOLD_TIME = 0.7
+BRIGHTNESS_TOGGLE_HOLD = 0.7
+SCREENSHOT_COOLDOWN = 1.0
+
+screen_w, screen_h = pyautogui.size()
+
+# başlangıç değişkenleri
+prev_x, prev_y = 0, 0
+last_click_time = 0
+last_volume_change_time = 0
+last_brightness_change_time = 0
+last_right_thumb_y = None
+last_left_thumb_y = None
+last_right_thumb_hold_start = None
+last_left_thumb_hold_start = None
+last_screenshot_time = 0
+_last_right_click_time = 0
+_prev_volume_before_mute = None
+_prev_brightness_before_off = None
+
+# pycaw setup
+if _HAS_PYCAW:
+    try:
+        devices = AudioUtilities.GetDefaultAudioEndpoint(
+            AudioUtilities.EDataFlow.eRender,
+            AudioUtilities.ERole.eMultimedia
+        )
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        _volume_interface = cast(interface, POINTER(IAudioEndpointVolume))
+    except Exception:
+        _volume_interface = None
+
+
+# =============== HELPERS ==================
+def finger_is_up(lm, tip, pip):
+    try:
+        return lm[tip].y < lm[pip].y - FINGER_UP_THRESHOLD
+    except Exception:
+        return False
+
+
+def count_fingers_up(lm):
+    fingers = [(8, 6), (12, 10), (16, 14), (20, 18), (4, 3)]
+    return sum(1 for tip, pip in fingers if finger_is_up(lm, tip, pip))
+
+
+def adjust_volume(direction):
+    global _volume_interface
+    if _volume_interface:
+        try:
+            cur = _volume_interface.GetMasterVolumeLevelScalar()
+            new = max(0.0, min(1.0, cur + direction * VOLUME_STEP))
+            _volume_interface.SetMasterVolumeLevelScalar(new, None)
+            return
+        except Exception:
+            pass
+    key = 'volumeup' if direction > 0 else 'volumedown'
+    pyautogui.press(key)
+
+
+def toggle_mute():
+    global _volume_interface, _prev_volume_before_mute
+    if _volume_interface:
+        try:
+            cur = _volume_interface.GetMasterVolumeLevelScalar()
+            if cur > 0.01:
+                _prev_volume_before_mute = cur
+                _volume_interface.SetMasterVolumeLevelScalar(0.0, None)
+            else:
+                if _prev_volume_before_mute is None:
+                    _prev_volume_before_mute = 0.5
+                _volume_interface.SetMasterVolumeLevelScalar(_prev_volume_before_mute, None)
+            return
+        except Exception:
+            pass
+    try:
+        pyautogui.press('volumemute')
+    except Exception:
+        pass
+
+
+def adjust_brightness(direction):
+    global _HAS_SBC
+    if _HAS_SBC:
+        try:
+            cur = sbc.get_brightness()
+            if isinstance(cur, list): cur = cur[0]
+            new = max(0, min(100, int(cur + direction * BRIGHTNESS_STEP)))
+            sbc.set_brightness(new)
+            return
+        except Exception:
+            pass
+    return
+
+
+def toggle_brightness_off_on():
+    global _HAS_SBC, _prev_brightness_before_off
+    if _HAS_SBC:
+        try:
+            cur = sbc.get_brightness()
+            if isinstance(cur, list): cur = cur[0]
+            if cur > 5:
+                _prev_brightness_before_off = cur
+                sbc.set_brightness(0)
+            else:
+                restore = _prev_brightness_before_off or 50
+                sbc.set_brightness(restore)
+            return
+        except Exception:
+            pass
+    return
+
+
+def take_screenshot():
+    os.makedirs("screenshots", exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join("screenshots", f"screenshot_{ts}.png")
+    img = pyautogui.screenshot()
+    img.save(path)
+    return path
+
+
+def draw_landmarks_on_image(rgb_image, hand_landmarks_list):
+    image_h, image_w, _ = rgb_image.shape
+    annotated_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+    connections = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (5, 9), (9, 10), (10, 11), (11, 12),
+        (9, 13), (13, 14), (14, 15), (15, 16),
+        (13, 17), (17, 18), (18, 19), (19, 20),
+        (0, 17)
+    ]
+    for landmarks in hand_landmarks_list:
+        for lm in landmarks:
+            x, y = int(lm.x * image_w), int(lm.y * image_h)
+            cv2.circle(annotated_image, (x, y), 2, (0, 255, 0), -1)
+        for start_idx, end_idx in connections:
+            start_lm = landmarks[start_idx]
+            end_lm = landmarks[end_idx]
+            pt1 = (int(start_lm.x * image_w), int(start_lm.y * image_h))
+            pt2 = (int(end_lm.x * image_w), int(end_lm.y * image_h))
+            cv2.line(annotated_image, pt1, pt2, (200, 200, 200), 1)
+    return annotated_image
+
+
+# ================ MAIN ====================
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+if not os.path.exists(MODEL_PATH):
+    print(f"HATA: '{MODEL_PATH}' dosyası bulunamadı!")
+    exit()
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.VIDEO,
+    num_hands=2,
+    min_hand_detection_confidence=0.6,
+    min_hand_presence_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+
+cap = cv2.VideoCapture(0)
+
+with HandLandmarker.create_from_options(options) as landmarker:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+
+        # Görüntüyü ayna moduna alıyoruz (kullanıcı deneyimi için önemli)
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = int(time.time() * 1000)
+
+        detection_result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        right_hand_detected = False
+        left_hand_detected = False
+        right_gesture = "NONE"
+        left_gesture = "NONE"
+        right_index_pos = None
+        left_index_pos = None
+        now = time.time()
+
+        hand_landmarks_list = detection_result.hand_landmarks
+        handedness_list = detection_result.handedness
+
+        if hand_landmarks_list:
+            for idx, hand_landmarks in enumerate(hand_landmarks_list):
+                handedness_obj = handedness_list[idx][0]
+                label = handedness_obj.category_name
+                lm = hand_landmarks
+
+                index_up = finger_is_up(lm, 8, 6)
+                middle_up = finger_is_up(lm, 12, 10)
+                ring_up = finger_is_up(lm, 16, 14)
+                pinky_up = finger_is_up(lm, 20, 18)
+                thumb_up = finger_is_up(lm, 4, 3)
+
+                index_tip = (lm[8].x, lm[8].y)
+                fingers_up_count = count_fingers_up(lm)
+
+                gesture = "UNKNOWN"
+                if fingers_up_count == 0:
+                    gesture = "FIST"
+                elif index_up and not middle_up and not ring_up and not pinky_up and not thumb_up:
+                    gesture = "LEFT_CLICK"
+                elif index_up and middle_up and not ring_up:
+                    gesture = "RIGHT_CLICK"
+                elif fingers_up_count >= 3:
+                    gesture = "OPEN"
+                elif thumb_up and fingers_up_count == 1:
+                    gesture = "THUMB_UP"
+                else:
+                    gesture = "UNKNOWN"
+
+                # ------ DÜZELTME BURADA YAPILDI ------
+                # Ayna modu olduğu için etiketleri TERS kabul ediyoruz.
+                # Model "Left" diyorsa, bu aslında senin SAĞ elindir.
+                if label == "Left":
+                    right_hand_detected = True
+                    right_gesture = gesture
+                    right_index_pos = index_tip
+                # Model "Right" diyorsa, bu aslında senin SOL elindir.
+                else:
+                    left_hand_detected = True
+                    left_gesture = gesture
+                    left_index_pos = index_tip
+                # -------------------------------------
+
+        # --------- IMLEÇ HAREKETİ (SAĞ EL) ----------
+        cursor_pos = None
+        if right_hand_detected and right_gesture == "OPEN":
+            cursor_pos = right_index_pos
+        elif left_hand_detected and left_gesture == "OPEN" and not right_hand_detected:
+            # Sadece sol el açıksa o yönetsin (opsiyonel)
+            cursor_pos = left_index_pos
+
+        if cursor_pos:
+            nx, ny = cursor_pos
+            x = int(nx * screen_w)
+            y = int(ny * screen_h)
+            cur_x = prev_x + (x - prev_x) / SMOOTHING
+            cur_y = prev_y + (y - prev_y) / SMOOTHING
+            try:
+                pyautogui.moveTo(cur_x, cur_y, _pause=False)
+            except Exception:
+                pass
+            prev_x, prev_y = cur_x, cur_y
+
+        # --------- LEFT CLICK ----------
+        if (right_hand_detected and right_gesture == "LEFT_CLICK") or (
+                left_hand_detected and left_gesture == "LEFT_CLICK"):
+            if now - last_click_time > CLICK_COOLDOWN:
+                pyautogui.click()
+                last_click_time = now
+
+        # --------- RIGHT CLICK ----------
+        if right_hand_detected and right_gesture == "RIGHT_CLICK":
+            if now - _last_right_click_time > CLICK_COOLDOWN:
+                pyautogui.rightClick()
+                _last_right_click_time = now
+
+        # --------- VOLUME (SAĞ EL BAŞPARMAK) ----------
+        current_right_thumb_y = None
+        current_left_thumb_y = None
+
+        # Etiketleri burada da TERS okuyoruz
+        if hand_landmarks_list:
+            for idx, hl in enumerate(hand_landmarks_list):
+                lbl = handedness_list[idx][0].category_name
+                # Model Left diyorsa -> Gerçek Sağ El
+                if lbl == "Left":
+                    current_right_thumb_y = hl[4].y
+                # Model Right diyorsa -> Gerçek Sol El
+                elif lbl == "Right":
+                    current_left_thumb_y = hl[4].y
+
+        if right_hand_detected and right_gesture == "THUMB_UP":
+            if current_right_thumb_y is not None:
+                if last_right_thumb_y is None:
+                    last_right_thumb_y = current_right_thumb_y
+                    last_right_thumb_hold_start = now
+                else:
+                    dy = last_right_thumb_y - current_right_thumb_y
+                    if abs(dy) > 0.015 and now - last_volume_change_time > VOLUME_COOLDOWN_TIME:
+                        adjust_volume(1 if dy > 0 else -1)
+                        last_volume_change_time = now
+                        last_right_thumb_y = current_right_thumb_y
+                    elif abs(dy) <= 0.007:
+                        if last_right_thumb_hold_start and (now - last_right_thumb_hold_start) > MUTE_HOLD_TIME:
+                            toggle_mute()
+                            last_right_thumb_hold_start = now + 0.5
+            else:
+                last_right_thumb_y = None
+                last_right_thumb_hold_start = None
+        else:
+            last_right_thumb_y = None
+            last_right_thumb_hold_start = None
+
+        # --------- BRIGHTNESS (SOL EL BAŞPARMAK) ----------
+        if left_hand_detected and left_gesture == "THUMB_UP":
+            if current_left_thumb_y is not None:
+                if last_left_thumb_y is None:
+                    last_left_thumb_y = current_left_thumb_y
+                    last_left_thumb_hold_start = now
+                else:
+                    dy = last_left_thumb_y - current_left_thumb_y
+                    if abs(dy) > 0.015 and now - last_brightness_change_time > BRIGHTNESS_COOLDOWN_TIME:
+                        adjust_brightness(1 if dy > 0 else -1)
+                        last_brightness_change_time = now
+                        last_left_thumb_y = current_left_thumb_y
+                    elif abs(dy) <= 0.007:
+                        if last_left_thumb_hold_start and (now - last_left_thumb_hold_start) > BRIGHTNESS_TOGGLE_HOLD:
+                            toggle_brightness_off_on()
+                            last_left_thumb_hold_start = now + 0.5
+            else:
+                last_left_thumb_y = None
+                last_left_thumb_hold_start = None
+        else:
+            last_left_thumb_y = None
+            last_left_thumb_hold_start = None
+
+        # --------- SCREENSHOT ----------
+        h = 0
+        if right_hand_detected and left_hand_detected and right_gesture == "OPEN" and left_gesture == "OPEN":
+            if now - last_screenshot_time > SCREENSHOT_COOLDOWN:
+                path = take_screenshot()
+                last_screenshot_time = now
+                cv2.putText(frame, f"Saved: {os.path.basename(path)}", (10, h - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+
+        if hand_landmarks_list:
+            frame = draw_landmarks_on_image(rgb_frame, hand_landmarks_list)
+
+        cv2.putText(frame, f"R:{right_gesture} L:{left_gesture}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0),
+                    2)
+
+        cv2.imshow("Hand Control (Fixed Right/Left)", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            break
+
+cap.release()
+cv2.destroyAllWindows()
