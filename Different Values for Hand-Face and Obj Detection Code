@@ -1,0 +1,134 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+import pyttsx3
+import webbrowser
+from ultralytics import YOLO
+
+# ================ MODEL YÜKLEME =================
+yolo_model = YOLO('best.pt')
+mp_hands = mp.solutions.hands
+mp_face_mesh = mp.solutions.face_mesh
+mp_draw = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# ================ AYARLAR =================
+SMOOTHING = 5.0
+CLICK_COOLDOWN = 0.30
+ACTION_COOLDOWN = 2.0
+FINGER_UP_THRESHOLD = 0.12
+screen_w, screen_h = pyautogui.size()
+
+prev_x, prev_y = 0, 0
+last_click_time = 0
+last_action_time = 0
+
+# --- SES AYARI ---
+engine = pyttsx3.init()
+engine.setProperty('rate', 180)
+
+
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
+
+
+# =============== HELPERS ==================
+def get_finger_status(lm):
+    fingers = []
+    # İşaret(8), Orta(12), Yüzük(16), Serçe(20)
+    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        fingers.append(lm[tip].y < lm[pip].y - FINGER_UP_THRESHOLD)
+    thumb_up = lm[4].y < lm[3].y - 0.05
+    return thumb_up, fingers
+
+
+# ================ MAIN ====================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7) as hands, \
+        mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True) as face_mesh:
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+        now = time.time()
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 1. ADIM: Face Mesh (Yüz Çizimi ve Filtre)
+        face_boxes = []
+        mesh_results = face_mesh.process(rgb_frame)
+        if mesh_results.multi_face_landmarks:
+            for face_landmarks in mesh_results.multi_face_landmarks:
+                mp_draw.draw_landmarks(frame, face_landmarks, mp_face_mesh.FACEMESH_CONTOURS,
+                                       None, mp_drawing_styles.get_default_face_mesh_contours_style())
+                all_x = [lm.x for lm in face_landmarks.landmark]
+                all_y = [lm.y for lm in face_landmarks.landmark]
+                face_boxes.append((int(min(all_x) * w), int(min(all_y) * h), int(max(all_x) * w), int(max(all_y) * h)))
+
+        # 2. ADIM: YOLO Nesne Tespiti
+        detected_objects = []
+        yolo_results = yolo_model(frame, stream=True, conf=0.15, device=0, verbose=False)
+        for r in yolo_results:
+            for box in r.boxes:
+                conf, (x1, y1, x2, y2) = float(box.conf[0]), map(int, box.xyxy[0])
+                label = yolo_model.names[int(box.cls[0])]
+                if any(f[0] < ((x1 + x2) // 2) < f[2] and f[1] < ((y1 + y2) // 2) < f[3] for f in face_boxes): continue
+                detected_objects.append({"label": label, "box": (x1, y1, x2, y2), "conf": conf})
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                cv2.putText(frame, f"{label} %{int(conf * 100)}", (x1, y1 - 10), 1, 1, (255, 255, 255), 1)
+
+        # 3. ADIM: El İşleme (Fare Kontrolü ve Komutlar)
+        hand_results = hands.process(rgb_frame)
+        if hand_results.multi_hand_landmarks:
+            for hand_landmarks in hand_results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                lm = hand_landmarks.landmark
+                thumb_up, fingers = get_finger_status(lm)
+                up_count = sum(fingers)
+                ix, iy = int(lm[8].x * w), int(lm[8].y * h)
+
+                # --- FARE HAREKETİ ---
+                if up_count >= 3:
+                    nx, ny = lm[8].x, lm[8].y
+                    x, y = int(nx * screen_w), int(ny * screen_h)
+                    cur_x = prev_x + (x - prev_x) / SMOOTHING
+                    cur_y = prev_y + (y - prev_y) / SMOOTHING
+                    pyautogui.moveTo(cur_x, cur_y, _pause=False)
+                    prev_x, prev_y = cur_x, cur_y
+
+                # --- SOL TIK  ---
+                if fingers[0] and not fingers[1] and (now - last_click_time > CLICK_COOLDOWN):
+                    pyautogui.click()
+                    last_click_time = now
+
+                # --- NESNE KOMUTLARI ---
+                for obj in detected_objects:
+                    ox1, oy1, ox2, oy2 = obj["box"]
+                    if ox1 < ix < ox2 and oy1 < iy < oy2:
+                        cv2.rectangle(frame, (ox1, oy1), (ox2, oy2), (0, 255, 0), 4)
+                        if now - last_action_time > ACTION_COOLDOWN:
+                            msg = ""
+                            if obj["label"] == "cups" and thumb_up and up_count == 0:
+                                pyautogui.press("playpause");
+                                msg = "Müzik kontrol edildi"
+                            elif obj["label"] == "phones" and up_count == 2:
+                                pyautogui.hotkey('win', 'prtscr');
+                                msg = "Ekran görüntüsü alındı"
+                            elif obj["label"] == "pencils" and up_count >= 3:
+                                pyautogui.press("volumemute");
+                                msg = "Sesi kapattım"
+                            elif obj["label"] == "keyboards" and not thumb_up and up_count == 0:
+                                pyautogui.hotkey('win', 'd');
+                                msg = "Masaüstüne dönüldü"
+                            if msg: speak(msg); last_action_time = now
+
+        cv2.imshow("Ultra Kontrol Paneli", frame)
+        if cv2.waitKey(1) & 0xFF == 27: break
+
+cap.release()
+cv2.destroyAllWindows()
